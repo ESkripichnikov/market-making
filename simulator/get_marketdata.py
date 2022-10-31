@@ -6,7 +6,7 @@ from tqdm import tqdm
 from simulator.data_structures import OrderbookSnapshotUpdate, MdUpdate, AnonTrade
 
 
-def load_data(path: str):
+def load_data(path: str, remove_outliers: bool = False):
     lobs_df = pd.read_csv(path + '/lobs.csv')
     trades_df = pd.read_csv(path + '/trades.csv')
 
@@ -15,6 +15,9 @@ def load_data(path: str):
     for column in ['receive_ts', 'exchange_ts']:
         lobs_df[column] = pd.to_datetime(lobs_df[column])
         trades_df[column] = pd.to_datetime(trades_df[column])
+    
+    if remove_outliers:
+        trades_df = trades_df[(trades_df.price > 1900) & (trades_df.price < 22000)]
 
     return lobs_df, trades_df
 
@@ -41,8 +44,8 @@ def get_marketdata(row, lobs: bool):
         return MdUpdate(None, trade)
 
 
-def load_md_from_file(path: str) -> list[MdUpdate]:
-    lobs_df, trades_df = load_data(path)
+def load_md_from_file(path: str, remove_outliers: bool = False) -> list[MdUpdate]:
+    lobs_df, trades_df = load_data(path, remove_outliers)
     print('Data loaded successfully')
 
     prices_and_volumes = ['ask_price', 'ask_vol', 'bid_price', 'bid_vol']

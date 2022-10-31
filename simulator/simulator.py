@@ -9,10 +9,10 @@ from simulator.get_marketdata import load_md_from_file
 
 
 class Simulator:
-    def __init__(self, path: str, execution_latency: float, md_latency: float, ready_md=None) -> None:
+    def __init__(self, path: str, execution_latency: float, md_latency: float, ready_md=None, remove_outliers=False) -> None:
         self.execution_latency = timedelta(milliseconds=execution_latency)
         self.md_latency = timedelta(milliseconds=md_latency)
-        self.md_queue = deque(ready_md) if ready_md else deque(load_md_from_file(path))
+        self.md_queue = deque(ready_md) if ready_md else deque(load_md_from_file(path, remove_outliers))
         self.actions_queue = deque()
         self.strategy_updates_queue = PriorityQueue()
         self.strategy_updates_queue.put((self.get_event_time('md'), self.md_queue[0]))
