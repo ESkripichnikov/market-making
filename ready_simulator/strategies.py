@@ -108,12 +108,12 @@ class StoikovStrategy:
             trade_size: float,
             delay: float,
             terminal_date,
-            k=1.5,  # alpha 0.2-0.8 K = 1/20 - 1/50
+            k=1.5,
             hold_time: Optional[float] = None,
-            risk_preference: Optional[float] = 0,
-            initial_vol: Optional[float] = 5e-08,
+            risk_preference: Optional[float] = 0.01,
+            initial_vol: Optional[float] = 2.19346e-08,
             vol_freq: Optional[float] = 1,
-            lamb: Optional[float] = 0.6,
+            lamb: Optional[float] = 0.95,
 
     ) -> None:
         """
@@ -121,7 +121,7 @@ class StoikovStrategy:
                 delay: delay between orders in nanoseconds
                 hold_time: holding time in nanoseconds
                 vol_freq:: volatility frequency in seconds
-                risk_preference: >0 for risk aversion, =0 for risk-neutrality, or <0 for risk-seeking
+                risk_preference: >0 for risk aversion, ~0 for risk-neutrality, or <0 for risk-seeking
                 initial_vol: initial volatility estimated on history
                 vol_freq: volatility frequency in seconds
                 lamb: lambda in EWMA for updating volatility
