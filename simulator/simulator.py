@@ -1,138 +1,342 @@
 from collections import deque
-from datetime import timedelta
-from queue import PriorityQueue
+from dataclasses import dataclass
+from typing import List, Optional, Tuple, Union, Deque, Dict
 
-import pandas as pd
-
-from simulator.data_structures import MdUpdate, Order, OwnTrade, CancelOrder
-from simulator.get_marketdata import load_md_from_file
+import numpy as np
+from sortedcontainers import SortedDict
 
 
-class Simulator:
-    def __init__(self, path: str, execution_latency: float, md_latency: float, ready_md=None, remove_outliers=False) -> None:
-        self.execution_latency = timedelta(milliseconds=execution_latency)
-        self.md_latency = timedelta(milliseconds=md_latency)
-        self.md_queue = deque(ready_md) if ready_md else deque(load_md_from_file(path, remove_outliers))
-        self.actions_queue = deque()
-        self.strategy_updates_queue = PriorityQueue()
-        self.strategy_updates_queue.put((self.get_event_time('md'), self.md_queue[0]))
-        self.best_bid = 0
-        self.best_ask = 0
+@dataclass
+class Order:  # Our own placed order
+    place_ts : float # ts when we place the order
+    exchange_ts : float # ts when exchange(simulator) get the order    
+    order_id: int
+    side: str
+    size: float
+    price: float
 
-        self.current_time = self.strategy_updates_queue.queue[0][0]
-        self.active_orders = []
-        self.order_id = 1
-        self.trade_id = 1
+        
+@dataclass
+class CancelOrder:
+    exchange_ts: float
+    id_to_delete : int
 
-    def get_event_time(self, style):
-        if style == 'md' and self.md_queue:
-            event_time = (
-                self.md_queue[0].orderbook.exchange_ts if self.md_queue[0].orderbook else
-                self.md_queue[0].trade.exchange_ts
-            )
-        elif style == 'strategy' and not self.strategy_updates_queue.empty():
-            event_time, _ = self.strategy_updates_queue.queue[0]
+@dataclass
+class AnonTrade:  # Market trade
+    exchange_ts : float
+    receive_ts : float
+    side: str
+    size: float
+    price: float
 
-        elif style == 'actions' and self.actions_queue:
-            event_time = self.actions_queue[0].timestamp
+
+@dataclass
+class OwnTrade:  # Execution of own placed order
+    place_ts : float # ts when we call place_order method, for debugging
+    exchange_ts: float
+    receive_ts: float
+    trade_id: int
+    order_id: int
+    side: str
+    size: float
+    price: float
+    execute : str # BOOK or TRADE
+
+
+    def __post_init__(self):
+        assert isinstance(self.side, str)
+
+@dataclass
+class OrderbookSnapshotUpdate:  # Orderbook tick snapshot
+    exchange_ts : float
+    receive_ts : float
+    asks: List[Tuple[float, float]]  # tuple[price, size]
+    bids: List[Tuple[float, float]]
+
+
+@dataclass
+class MdUpdate:  # Data of a tick
+    exchange_ts : float
+    receive_ts : float
+    orderbook: Optional[OrderbookSnapshotUpdate] = None
+    trade: Optional[AnonTrade] = None
+
+
+def update_best_positions(best_bid, best_ask, md:MdUpdate, levels:bool = False) -> Tuple[float, float]:
+    if md.orderbook is not None:
+        best_bid = md.orderbook.bids[0][0]
+        best_ask = md.orderbook.asks[0][0]
+        if levels:
+            asks = [level[0] for level in md.orderbook.asks]
+            bids = [level[0] for level in md.orderbook.bids]
+            return best_bid, best_ask, asks, bids
         else:
-            event_time = pd.Timestamp.max
-
-        return event_time
-
-    def apply_md_update(self, md: MdUpdate):
-        if md.orderbook:
-            self.best_ask = md.orderbook.asks[0][0]
-            self.best_bid = md.orderbook.bids[0][0]
-            receive_ts = md.orderbook.receive_ts
+            return best_bid, best_ask
+    else:
+        if md.trade.side == 'BID':
+            best_ask = max(md.trade.price, best_ask)
+        elif md.trade.side == 'ASK':
+            best_bid = min(best_bid, md.trade.price)
+        return best_bid, best_ask
+        
+    
+    
+    if not md.orderbook is None:
+        best_bid = md.orderbook.bids[0][0]
+        best_ask = md.orderbook.asks[0][0]
+    elif not md.trade is None:
+        if md.trade.side == 'BID':
+            best_ask = max(md.trade.price, best_ask)
+        elif md.trade.side == 'ASK':
+            best_bid = min(best_bid, md.trade.price)
         else:
-            side = md.trade.side
-            price = md.trade.price
-            if side == 'BID':
-                self.best_ask = price
-            else:
-                self.best_bid = price
-            receive_ts = md.trade.receive_ts
+            assert False, "WRONG TRADE SIDE"
+    assert best_ask > best_bid, "wrong best positions"
+    return best_bid, best_ask
 
-        self.strategy_updates_queue.put((receive_ts, md))
 
-    def tick(self):
-        strategy_time = self.get_event_time('strategy')
-        md_time = self.get_event_time('md')
-        actions_time = self.get_event_time('actions')
-
-        while md_time <= strategy_time or actions_time <= strategy_time:
-            if md_time < actions_time:
-                self.apply_md_update(self.md_queue.popleft())
-                self.execute_orders()
-
-                self.current_time = md_time
-                md_time = self.get_event_time('md')
-                strategy_time = self.get_event_time('strategy')
-            else:
-                self.prepare_orders(self.actions_queue.popleft())
-                self.execute_orders()
-
-                self.current_time = actions_time
-                actions_time = self.get_event_time('actions')
-                strategy_time = self.get_event_time('strategy')
-
-        return self.strategy_updates_queue.get_nowait()
-
-    def check_order(self, order: Order) -> bool:
-        if order.side == 'BID' and order.price >= self.best_ask:
-            return 1
-
-        if order.side == 'ASK' and order.price <= self.best_bid:
-            return 1
-
-        return 0
-
-    def prepare_orders(self, action_order) -> None:
-        if isinstance(action_order, Order):
-            self.active_orders.append(action_order)
-        else:
-            for order in self.active_orders:
-                if order.order_id == action_order.order_id:
-                    self.active_orders.remove(order)
-
-    def execute_orders(self) -> list[Order]:
-        for order in self.active_orders:
-            if self.check_order(order):
-                self.strategy_updates_queue.put(
-                    (self.current_time + self.md_latency,
-                     OwnTrade(
-                         exchange_ts=self.current_time,
-                         receive_ts=self.current_time + self.md_latency,
-                         trade_id=self.trade_id,
-                         order_id=order.order_id,
-                         side=order.side,
-                         size=order.size,
-                         price=order.price
-                     )
-                     )
-                )
-
-                self.trade_id += 1
-                self.active_orders.remove(order)
-
-        return self.active_orders
-
-    def place_order(self, side: str, size: float, price: float) -> Order:
-        new_order = Order(
-            order_id=self.order_id,
-            side=side,
-            size=size,
-            price=price,
-            timestamp=self.current_time + self.execution_latency
-        )
-        self.actions_queue.append(new_order)
+class Sim:
+    def __init__(self, market_data: List[MdUpdate], execution_latency: float, md_latency: float) -> None:
+        '''
+            Args:
+                market_data(List[MdUpdate]): market data
+                execution_latency(float): latency in nanoseconds
+                md_latency(float): latency in nanoseconds
+        '''   
+        #transform md to queue
+        self.md_queue = deque( market_data )
+        #action queue
+        self.actions_queue:Deque[ Union[Order, CancelOrder] ] = deque()
+        #SordetDict: receive_ts -> [updates]
+        self.strategy_updates_queue = SortedDict()
+        #map : order_id -> Order
+        self.ready_to_execute_orders:Dict[int, Order] = {}
+        
+        #current md
+        self.md:Optional[MdUpdate] = None
+        #current ids
+        self.order_id = 0
+        self.trade_id = 0
+        #latency
+        self.latency = execution_latency
+        self.md_latency = md_latency
+        #current bid and ask
+        self.best_bid = -np.inf
+        self.best_ask = np.inf
+        #current trade 
+        self.trade_price = {}
+        self.trade_price['BID'] = -np.inf
+        self.trade_price['ASK'] = np.inf
+        #last order
+        self.last_order:Optional[Order] = None
+        
+    
+    def get_md_queue_event_time(self) -> np.float:
+        return np.inf if len(self.md_queue) == 0 else self.md_queue[0].exchange_ts
+    
+    
+    def get_actions_queue_event_time(self) -> np.float:
+        return np.inf if len(self.actions_queue) == 0 else self.actions_queue[0].exchange_ts
+    
+    
+    def get_strategy_updates_queue_event_time(self) -> np.float:
+        return np.inf if len(self.strategy_updates_queue) == 0 else self.strategy_updates_queue.keys()[0]
+    
+    
+    def get_order_id(self) -> int:
+        res = self.order_id
         self.order_id += 1
-        return new_order
+        return res
+    
+    
+    def get_trade_id(self) -> int:
+        res = self.trade_id
+        self.trade_id += 1
+        return res
+    
 
-    def cancel_order(self, order_id: int) -> None:
-        new_cancel_order = CancelOrder(
-            order_id=order_id,
-            timestamp=self.current_time + self.execution_latency
-        )
-        self.actions_queue.append(new_cancel_order)
+    def update_best_pos(self) -> None:
+        assert not self.md is None, "no current market data!" 
+        if not self.md.orderbook is None:
+            self.best_bid = self.md.orderbook.bids[0][0]
+            self.best_ask = self.md.orderbook.asks[0][0]
+    
+    
+    def update_last_trade(self) -> None:
+        assert not self.md is None, "no current market data!"
+        if not self.md.trade is None:
+            self.trade_price[self.md.trade.side] = self.md.trade.price
+
+
+    def delete_last_trade(self) -> None:
+        self.trade_price['BID'] = -np.inf
+        self.trade_price['ASK'] = np.inf
+
+
+    def update_md(self, md:MdUpdate) -> None:
+        #current orderbook
+        self.md = md 
+        #update position
+        self.update_best_pos()
+        #update info about last trade
+        self.update_last_trade()
+
+        #add md to strategy_updates_queue
+        if not md.receive_ts in self.strategy_updates_queue.keys():
+            self.strategy_updates_queue[md.receive_ts] = []
+        self.strategy_updates_queue[md.receive_ts].append(md)
+        
+    
+    def update_action(self, action:Union[Order, CancelOrder]) -> None:
+        
+        if isinstance(action, Order):
+            #self.ready_to_execute_orders[action.order_id] = action
+            #save last order to try to execute it aggressively
+            self.last_order = action
+        elif isinstance(action, CancelOrder):    
+            #cancel order
+            if action.id_to_delete in self.ready_to_execute_orders:
+                self.ready_to_execute_orders.pop(action.id_to_delete)
+        else:
+            assert False, "Wrong action type!"
+
+        
+    def tick(self) -> Tuple[ float, List[ Union[OwnTrade, MdUpdate] ] ]:
+        '''
+            Simulation tick
+
+            Returns:
+                receive_ts(float): receive timestamp in nanoseconds
+                res(List[Union[OwnTrade, MdUpdate]]): simulation result. 
+        '''
+        while True:     
+            #get event time for all the queues
+            strategy_updates_queue_et = self.get_strategy_updates_queue_event_time()
+            md_queue_et = self.get_md_queue_event_time()
+            actions_queue_et = self.get_actions_queue_event_time()
+            
+            #if both queue are empty
+            if md_queue_et == np.inf and actions_queue_et == np.inf:
+                break
+
+            #strategy queue has minimum event time
+            if strategy_updates_queue_et < min(md_queue_et, actions_queue_et):
+                break
+
+
+            if md_queue_et <= actions_queue_et:
+                self.update_md( self.md_queue.popleft() )
+            if actions_queue_et <= md_queue_et:
+                self.update_action( self.actions_queue.popleft() )
+
+            #execute last order aggressively
+            self.execute_last_order()
+            #execute orders with current orderbook
+            self.execute_orders()
+            #delete last trade
+            self.delete_last_trade()
+        #end of simulation
+        if len(self.strategy_updates_queue) == 0:
+            return np.inf, None
+        key = self.strategy_updates_queue.keys()[0]
+        res = self.strategy_updates_queue.pop(key)
+        return key, res
+
+
+    def execute_last_order(self) -> None:
+        '''
+            this function tries to execute self.last order aggressively
+        '''
+        #nothing to execute
+        if self.last_order is None:
+            return
+
+        executed_price, execute = None, None
+        #
+        if self.last_order.side == 'BID' and self.last_order.price >= self.best_ask:
+            executed_price = self.best_ask
+            execute = 'BOOK'
+        #    
+        elif self.last_order.side == 'ASK' and self.last_order.price <= self.best_bid:
+            executed_price = self.best_bid
+            execute = 'BOOK'
+
+        if not executed_price is None:
+            executed_order = OwnTrade(
+                self.last_order.place_ts, # when we place the order
+                self.md.exchange_ts, #exchange ts
+                self.md.exchange_ts + self.md_latency, #receive ts
+                self.get_trade_id(), #trade id
+                self.last_order.order_id, 
+                self.last_order.side, 
+                self.last_order.size, 
+                executed_price, execute)
+            #add order to strategy update queue
+            #there is no defaultsorteddict so I have to do this
+            if not executed_order.receive_ts in self.strategy_updates_queue:
+                self.strategy_updates_queue[ executed_order.receive_ts ] = []
+            self.strategy_updates_queue[ executed_order.receive_ts ].append(executed_order)
+        else:
+            self.ready_to_execute_orders[self.last_order.order_id] = self.last_order
+
+        #delete last order
+        self.last_order = None
+
+
+    def execute_orders(self) -> None:
+        executed_orders_id = []
+        for order_id, order in self.ready_to_execute_orders.items():
+
+            executed_price, execute = None, None
+
+            #
+            if order.side == 'BID' and order.price >= self.best_ask:
+                executed_price = order.price
+                execute = 'BOOK'
+            #    
+            elif order.side == 'ASK' and order.price <= self.best_bid:
+                executed_price = order.price
+                execute = 'BOOK'
+            #
+            elif order.side == 'BID' and order.price >= self.trade_price['ASK']:
+                executed_price = order.price
+                execute = 'TRADE'    
+            #
+            elif order.side == 'ASK' and order.price <= self.trade_price['BID']:
+                executed_price = order.price
+                execute = 'TRADE'
+
+            if not executed_price is None:
+                executed_order = OwnTrade(
+                    order.place_ts, # when we place the order
+                    self.md.exchange_ts, #exchange ts
+                    self.md.exchange_ts + self.md_latency, #receive ts
+                    self.get_trade_id(), #trade id
+                    order_id, order.side, order.size, executed_price, execute)
+        
+                executed_orders_id.append(order_id)
+
+                #added order to strategy update queue
+                #there is no defaultsorteddict so i have to do this
+                if not executed_order.receive_ts in self.strategy_updates_queue:
+                    self.strategy_updates_queue[ executed_order.receive_ts ] = []
+                self.strategy_updates_queue[ executed_order.receive_ts ].append(executed_order)
+        
+        #deleting executed orders
+        for k in executed_orders_id:
+            self.ready_to_execute_orders.pop(k)
+
+
+    def place_order(self, ts:float, size:float, side:str, price:float) -> Order:
+        #добавляем заявку в список всех заявок
+        order = Order(ts, ts + self.latency, self.get_order_id(), side, size, price)
+        self.actions_queue.append(order)
+        return order
+
+    
+    def cancel_order(self, ts:float, id_to_delete:int) -> CancelOrder:
+        #добавляем заявку на удаление
+        ts += self.latency
+        delete_order = CancelOrder(ts, id_to_delete)
+        self.actions_queue.append(delete_order)
+        return delete_order
